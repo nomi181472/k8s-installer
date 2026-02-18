@@ -306,7 +306,7 @@ if [[ "$GPU_PRESENT" == "true" ]]; then
   # 10e: Run GPU test pod
   header "STEP 10e: Running GPU Test Pod"
 
-  log "Deploying GPU test pod (nvidia/cuda:12.4.0-base-ubuntu22.04)..."
+  log "Deploying GPU test pod (nvidia/cuda:12.4.0-runtime-ubuntu22.04)..."
   cat <<'GPUPOD' | $KUBECTL_PATH apply -f -
 apiVersion: v1
 kind: Pod
@@ -317,9 +317,10 @@ metadata:
     app: gpu-test
 spec:
   restartPolicy: Never
+  runtimeClassName: nvidia
   containers:
     - name: gpu-test
-      image: nvidia/cuda:12.4.0-base-ubuntu22.04
+      image: nvidia/cuda:12.4.0-runtime-ubuntu22.04
       command: ["nvidia-smi"]
       resources:
         limits:

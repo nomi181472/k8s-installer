@@ -61,6 +61,9 @@ if command -v helm &>/dev/null; then
     log "No gpu-test pod found, skipping."
   fi
 
+  # Remove saved gpu-test pod manifest
+  rm -f /root/gpu-test-pod.yaml && log "Removed /root/gpu-test-pod.yaml" || true
+
   # Uninstall GPU Operator Helm release
   if helm status gpu-operator -n gpu-operator &>/dev/null 2>&1; then
     log "Uninstalling GPU Operator Helm release..."
