@@ -144,7 +144,59 @@ log "Resetting any previous kubeadm state..."
 $KUBEADM_PATH reset -f 2>/dev/null || true
 rm -rf /etc/kubernetes /var/lib/etcd
 
-NODE_IP=$(hostname -I | awk '{print $1}')
+# -----------------------------------------------
+# Create dummy network interface for stable API server IP
+# -----------------------------------------------
+DUMMY_IFACE="kube-dummy0"
+NODE_IP="192.168.255.1"
+
+log "Creating dummy interface $DUMMY_IFACE with IP $NODE_IP..."
+
+# Load dummy kernel module
+modprobe dummy
+
+# Remove existing dummy interface if present
+if ip link show $DUMMY_IFACE &>/dev/null 2>&1; then
+  ip link delete $DUMMY_IFACE
+  log "Removed existing $DUMMY_IFACE interface."
+fi
+
+# Create and configure the dummy interface
+ip link add $DUMMY_IFACE type dummy
+ip addr add ${NODE_IP}/32 dev $DUMMY_IFACE
+ip link set $DUMMY_IFACE up
+log "Dummy interface $DUMMY_IFACE created with IP $NODE_IP."
+
+# Persist dummy interface across reboots via a dedicated systemd service
+# (avoids dependency on systemd-networkd which may be disabled)
+cat <<EOF > /etc/systemd/system/kube-dummy-iface.service
+[Unit]
+Description=Create kube-dummy0 interface for Kubernetes API server
+Before=kubelet.service
+After=network.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c '\
+  modprobe dummy; \
+  ip link show ${DUMMY_IFACE} > /dev/null 2>&1 && ip link delete ${DUMMY_IFACE} || true; \
+  ip link add ${DUMMY_IFACE} type dummy; \
+  ip addr add ${NODE_IP}/32 dev ${DUMMY_IFACE}; \
+  ip link set ${DUMMY_IFACE} up'
+ExecStop=/bin/bash -c '\
+  ip link show ${DUMMY_IFACE} > /dev/null 2>&1 && \
+  ip link set ${DUMMY_IFACE} down && \
+  ip link delete ${DUMMY_IFACE} || true'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable kube-dummy-iface.service
+log "kube-dummy0 persistence configured via systemd service (kube-dummy-iface.service)."
 log "Node IP: $NODE_IP"
 
 log "Running kubeadm init..."
