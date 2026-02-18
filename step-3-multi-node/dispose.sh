@@ -1,14 +1,26 @@
 #!/bin/bash
 
 # =============================================================
-# Kubernetes Multi-Node Complete Uninstall / Reset Script
+# Kubernetes Multi-Node Uninstall / Reset Script
 # Ubuntu 24.04 LTS
-# Usage:
-#   MASTER:  sudo bash dispose-kube-multi.sh master
-#   WORKER:  sudo bash dispose-kube-multi.sh worker
+# Run on MASTER to clean the full cluster, or on a WORKER
+# to drain + remove it from the cluster then reset itself.
 #
-# Includes: GPU Operator, NVIDIA container toolkit, Helm cleanup
-# Run on each node independently.
+# Usage:
+#   Master teardown (full cluster wipe):
+#     sudo bash dispose-kube.sh --role master
+#
+#   Worker teardown (remove self from cluster, then reset):
+#     sudo bash dispose-kube.sh --role worker --master-ip <MASTER_IP>
+#
+#   Worker teardown from MASTER side (drain + delete node):
+#     sudo bash dispose-kube.sh --role master --drain-node <NODE_NAME>
+#
+# Options:
+#   --role <master|worker>    Required. Node role.
+#   --master-ip <IP>          Master IP (required for --role worker).
+#   --drain-node <name>       Drain + delete a specific worker from master.
+#   --force                   Skip confirmation prompts.
 # =============================================================
 
 set -e
@@ -23,378 +35,578 @@ NC='\033[0m'
 
 log()    { echo -e "${GREEN}[INFO]${NC} $1"; }
 warn()   { echo -e "${YELLOW}[WARN]${NC} $1"; }
+error()  { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 header() { echo -e "\n${BLUE}========== $1 ==========${NC}\n"; }
 
 # -----------------------------------------------
-# Argument Parsing
+# Defaults
 # -----------------------------------------------
-ROLE="${1:-}"
-
-if [[ "$ROLE" != "master" && "$ROLE" != "worker" ]]; then
-  echo ""
-  echo -e "${CYAN}Kubernetes Multi-Node Dispose Script${NC}"
-  echo ""
-  echo "  Usage:"
-  echo "    Master node:  sudo bash $0 master"
-  echo "    Worker node:  sudo bash $0 worker"
-  echo ""
-  echo "  Run on WORKERS first, then run on the MASTER."
-  echo "  (Or run independently on any node to fully clean it.)"
-  echo ""
-  exit 1
-fi
-
-if [[ $EUID -ne 0 ]]; then
-  echo "Run as root: sudo bash $0 $ROLE"
-  exit 1
-fi
-
-log "Cleaning up node as: $ROLE"
+ROLE=""
+MASTER_IP=""
+DRAIN_NODE=""
+FORCE=false
 
 # -----------------------------------------------
-# STEP 1: Drain node from cluster (master only)
+# Parse arguments
 # -----------------------------------------------
-header "STEP 1: Pre-cleanup (Cluster-level)"
-
-if [[ "$ROLE" == "master" ]]; then
-  export KUBECONFIG=/etc/kubernetes/admin.conf
-
-  if [[ -f /etc/kubernetes/admin.conf ]] && command -v kubectl &>/dev/null; then
-    log "Attempting to cordon and drain all nodes before teardown..."
-
-    # Get all non-master nodes and drain them
-    WORKER_NODES=$(kubectl get nodes --no-headers 2>/dev/null | \
-      grep -v "control-plane\|master" | awk '{print $1}' || true)
-
-    if [[ -n "$WORKER_NODES" ]]; then
-      for NODE in $WORKER_NODES; do
-        log "Draining worker node: $NODE"
-        kubectl drain "$NODE" \
-          --ignore-daemonsets \
-          --delete-emptydir-data \
-          --force \
-          --timeout=60s 2>/dev/null || warn "Could not fully drain $NODE (may already be unreachable)."
-        kubectl delete node "$NODE" 2>/dev/null || true
-        log "Removed node $NODE from cluster."
-      done
-    else
-      log "No worker nodes found to drain."
-    fi
-  else
-    log "kubectl or admin.conf not available — skipping cluster drain."
-  fi
-
-elif [[ "$ROLE" == "worker" ]]; then
-  log "Worker node: no cluster-level drain needed here."
-  log "Tip: drain this node from the master BEFORE running this script for a clean removal:"
-  log "  kubectl drain <node-name> --ignore-daemonsets --delete-emptydir-data --force"
-  log "  kubectl delete node <node-name>"
-  echo ""
-fi
-
-# -----------------------------------------------
-# STEP 2: Reset kubeadm
-# -----------------------------------------------
-header "STEP 2: Reset kubeadm"
-
-if command -v kubeadm &>/dev/null; then
-  log "Running kubeadm reset..."
-  kubeadm reset -f || true
-else
-  log "kubeadm not found, skipping."
-fi
-
-# -----------------------------------------------
-# STEP 3: Stop all Kubernetes services
-# -----------------------------------------------
-header "STEP 3: Stopping Services"
-
-for SVC in kubelet containerd; do
-  systemctl stop    $SVC 2>/dev/null && log "Stopped $SVC."   || true
-  systemctl disable $SVC 2>/dev/null && log "Disabled $SVC."  || true
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --role)       ROLE="$2";       shift 2 ;;
+    --master-ip)  MASTER_IP="$2";  shift 2 ;;
+    --drain-node) DRAIN_NODE="$2"; shift 2 ;;
+    --force)      FORCE=true;      shift ;;
+    -h|--help)
+      grep '^#' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *) warn "Unknown argument: $1"; shift ;;
+  esac
 done
 
 # -----------------------------------------------
-# STEP 4: Remove GPU Operator via Helm (master only)
+# Root check
 # -----------------------------------------------
-header "STEP 4: Removing NVIDIA GPU Operator"
+if [[ $EUID -ne 0 ]]; then
+  error "Please run as root: sudo bash $0"
+fi
 
-if [[ "$ROLE" == "master" ]]; then
-  if command -v helm &>/dev/null; then
+# -----------------------------------------------
+# Validate args
+# -----------------------------------------------
+if [[ -z "$ROLE" ]]; then
+  error "Must specify --role master or --role worker"
+fi
+
+if [[ "$ROLE" == "worker" && -z "$MASTER_IP" ]]; then
+  error "Worker teardown requires --master-ip <IP>"
+fi
+
+# -----------------------------------------------
+# Confirmation prompt
+# -----------------------------------------------
+if [[ "$FORCE" != "true" ]]; then
+  echo -e "${RED}"
+  if [[ -n "$DRAIN_NODE" ]]; then
+    echo "  ⚠  This will DRAIN and DELETE node '$DRAIN_NODE' from the cluster."
+  elif [[ "$ROLE" == "master" ]]; then
+    echo "  ⚠  This will DESTROY the entire Kubernetes cluster on this master."
+    echo "     All worker nodes will become orphaned and must be reset separately."
+  else
+    echo "  ⚠  This will remove this WORKER node from the cluster (${MASTER_IP})"
+    echo "     and wipe all Kubernetes components from this machine."
+  fi
+  echo -e "${NC}"
+  read -r -p "  Type 'yes' to continue: " CONFIRM
+  [[ "$CONFIRM" != "yes" ]] && { log "Aborted."; exit 0; }
+fi
+
+# =============================================================
+# MASTER-SIDE: Drain + delete a specific worker node only
+# =============================================================
+if [[ -n "$DRAIN_NODE" ]]; then
+  export KUBECONFIG=/etc/kubernetes/admin.conf
+  KUBECTL_PATH=$(which kubectl 2>/dev/null || echo "/usr/bin/kubectl")
+
+  header "Draining Worker Node: $DRAIN_NODE"
+
+  log "Cordon node (no new scheduling)..."
+  $KUBECTL_PATH cordon "$DRAIN_NODE" 2>/dev/null || warn "Could not cordon node."
+
+  log "Draining node (evicting all pods)..."
+  $KUBECTL_PATH drain "$DRAIN_NODE" \
+    --ignore-daemonsets \
+    --delete-emptydir-data \
+    --force \
+    --grace-period=30 \
+    --timeout=120s 2>/dev/null || warn "Drain encountered issues (may be OK for offline node)."
+
+  log "Deleting node from cluster..."
+  $KUBECTL_PATH delete node "$DRAIN_NODE" --force 2>/dev/null || warn "Node may already be gone."
+
+  echo ""
+  log "Node '$DRAIN_NODE' removed from cluster."
+  log "Now go run 'sudo bash dispose-kube.sh --role worker --master-ip <IP>' on that machine to wipe it."
+  echo ""
+  $KUBECTL_PATH get nodes -o wide
+  exit 0
+fi
+
+# =============================================================
+# WORKER teardown (run on the worker machine itself)
+# =============================================================
+if [[ "$ROLE" == "worker" ]]; then
+
+  THIS_NODE=$(hostname)
+
+  header "Worker Node Teardown: $THIS_NODE"
+  log "Master IP: $MASTER_IP"
+
+  # -----------------------------------------------
+  # STEP 1: Notify master to drain + delete this node
+  # (requires kubectl + kubeconfig from master, or SSH)
+  # -----------------------------------------------
+  header "STEP 1: Notifying Master to Remove This Node"
+
+  if command -v kubectl &>/dev/null && [[ -f /etc/kubernetes/admin.conf ]]; then
     export KUBECONFIG=/etc/kubernetes/admin.conf
+    warn "This worker has a local kubeconfig — attempting self-drain (unusual, continuing anyway)."
+    kubectl drain "$THIS_NODE" --ignore-daemonsets --delete-emptydir-data --force --grace-period=30 2>/dev/null || true
+    kubectl delete node "$THIS_NODE" --force 2>/dev/null || true
+  else
+    warn "No local kubeconfig on worker. Manual step required from master:"
+    warn "  sudo bash dispose-kube.sh --role master --drain-node $THIS_NODE"
+    warn "Continuing with local cleanup regardless..."
+  fi
 
-    # Delete GPU test pod if it exists
+  # -----------------------------------------------
+  # STEP 2: Reset kubeadm
+  # -----------------------------------------------
+  header "STEP 2: kubeadm Reset"
+
+  if command -v kubeadm &>/dev/null; then
+    log "Running kubeadm reset..."
+    kubeadm reset -f || true
+  else
+    log "kubeadm not found, skipping."
+  fi
+
+  # -----------------------------------------------
+  # STEP 3: Stop services
+  # -----------------------------------------------
+  header "STEP 3: Stopping Services"
+
+  for SVC in kubelet containerd; do
+    systemctl stop $SVC 2>/dev/null    && log "Stopped $SVC."   || true
+    systemctl disable $SVC 2>/dev/null && log "Disabled $SVC."  || true
+  done
+
+  # -----------------------------------------------
+  # STEP 4: Remove NVIDIA container toolkit (if present)
+  # -----------------------------------------------
+  header "STEP 4: Removing NVIDIA Container Toolkit"
+
+  apt remove -y --purge \
+    nvidia-container-toolkit \
+    nvidia-container-toolkit-base \
+    libnvidia-container-tools \
+    libnvidia-container1 \
+    2>/dev/null || true
+
+  rm -f /etc/apt/sources.list.d/nvidia-container-toolkit.list
+  rm -f /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+  apt autoremove -y --purge 2>/dev/null || true
+  log "NVIDIA container toolkit removed."
+
+  # -----------------------------------------------
+  # STEP 5: Remove Kubernetes packages
+  # -----------------------------------------------
+  header "STEP 5: Removing Kubernetes Packages"
+
+  apt-mark unhold kubelet kubeadm kubectl 2>/dev/null || true
+
+  apt remove -y --purge \
+    kubelet kubeadm kubectl \
+    kubernetes-cni containernetworking-plugins \
+    containerd runc \
+    2>/dev/null || true
+
+  apt autoremove -y --purge 2>/dev/null || true
+  apt clean
+
+  # -----------------------------------------------
+  # STEP 6: Remove directories
+  # -----------------------------------------------
+  header "STEP 6: Removing Config & Data Directories"
+
+  DIRS=(
+    /etc/kubernetes /var/lib/kubelet /var/lib/etcd
+    /var/lib/containerd /var/run/kubernetes /etc/containerd
+    /opt/cni /etc/cni /var/lib/cni
+    /run/flannel /etc/flannel
+    /var/log/pods /var/log/containers
+    /root/.kube "/home/*/.kube"
+  )
+
+  for DIR in "${DIRS[@]}"; do
+    if ls $DIR 2>/dev/null | head -1 &>/dev/null; then
+      rm -rf $DIR
+      log "Removed: $DIR"
+    fi
+  done
+
+  # -----------------------------------------------
+  # STEP 7: Remove apt repo and keys
+  # -----------------------------------------------
+  header "STEP 7: Removing Kubernetes Apt Repo"
+
+  rm -f /etc/apt/sources.list.d/kubernetes.list
+  rm -f /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  apt update -y
+  log "Kubernetes apt repo removed."
+
+  # -----------------------------------------------
+  # STEP 8: Sysctl and module config
+  # -----------------------------------------------
+  header "STEP 8: Removing sysctl & Module Config"
+
+  rm -f /etc/sysctl.d/k8s.conf
+  rm -f /etc/modules-load.d/k8s.conf
+  sysctl --system > /dev/null 2>&1
+  log "sysctl and module config removed."
+
+  # -----------------------------------------------
+  # STEP 9: Flush iptables
+  # -----------------------------------------------
+  header "STEP 9: Flushing iptables"
+
+  iptables -F; iptables -X
+  iptables -t nat -F; iptables -t nat -X
+  iptables -t mangle -F; iptables -t mangle -X
+  iptables -P INPUT ACCEPT
+  iptables -P FORWARD ACCEPT
+  iptables -P OUTPUT ACCEPT
+
+  ip6tables -F; ip6tables -X
+  ip6tables -t nat -F 2>/dev/null; ip6tables -t nat -X 2>/dev/null
+  ip6tables -t mangle -F 2>/dev/null; ip6tables -t mangle -X 2>/dev/null
+  ip6tables -P INPUT ACCEPT
+  ip6tables -P FORWARD ACCEPT
+  ip6tables -P OUTPUT ACCEPT
+
+  log "iptables flushed."
+
+  # -----------------------------------------------
+  # STEP 10: Remove virtual network interfaces
+  # -----------------------------------------------
+  header "STEP 10: Removing Virtual Network Interfaces"
+
+  for IFACE in flannel.1 cni0 docker0 tunl0; do
+    if ip link show $IFACE &>/dev/null; then
+      ip link set $IFACE down
+      ip link delete $IFACE
+      log "Removed interface: $IFACE"
+    fi
+  done
+
+  # -----------------------------------------------
+  # STEP 11: Re-enable swap
+  # -----------------------------------------------
+  header "STEP 11: Re-enabling Swap"
+
+  systemctl unmask swap.target 2>/dev/null || true
+  sed -i 's/^#\(.*swap.*\)/\1/' /etc/fstab
+  swapon -a 2>/dev/null || true
+  log "Swap re-enabled."
+
+  # -----------------------------------------------
+  # STEP 12: Clean .bashrc
+  # -----------------------------------------------
+  header "STEP 12: Cleaning .bashrc"
+
+  for RCFILE in /root/.bashrc /home/*/.bashrc; do
+    if [[ -f "$RCFILE" ]]; then
+      sed -i '/kubectl completion/d' "$RCFILE"
+      sed -i '/alias k=kubectl/d' "$RCFILE"
+      sed -i '/complete.*kubectl/d' "$RCFILE"
+      log "Cleaned: $RCFILE"
+    fi
+  done
+
+  header "Worker Node Cleanup Complete!"
+  echo -e "${GREEN}"
+  echo "  This worker node has been fully reset."
+  echo "  It has been removed from the cluster (or you still need to run"
+  echo "  the drain step from the master if not done yet)."
+  echo -e "${NC}"
+  exit 0
+fi
+
+# =============================================================
+# MASTER teardown (full cluster wipe)
+# =============================================================
+if [[ "$ROLE" == "master" ]]; then
+
+  header "Master Node Full Cluster Teardown"
+
+  # -----------------------------------------------
+  # STEP 1: Drain all worker nodes first
+  # -----------------------------------------------
+  header "STEP 1: Draining All Worker Nodes"
+
+  export KUBECONFIG=/etc/kubernetes/admin.conf
+  KUBECTL_PATH=$(which kubectl 2>/dev/null || echo "/usr/bin/kubectl")
+
+  if command -v kubectl &>/dev/null && [[ -f /etc/kubernetes/admin.conf ]]; then
+    WORKERS=$($KUBECTL_PATH get nodes --no-headers 2>/dev/null | \
+      grep -v "control-plane\|master" | awk '{print $1}') || true
+
+    if [[ -n "$WORKERS" ]]; then
+      for NODE in $WORKERS; do
+        log "Draining worker: $NODE"
+        $KUBECTL_PATH cordon "$NODE" 2>/dev/null || true
+        $KUBECTL_PATH drain "$NODE" \
+          --ignore-daemonsets \
+          --delete-emptydir-data \
+          --force \
+          --grace-period=30 \
+          --timeout=120s 2>/dev/null || warn "Drain had issues on $NODE (may be offline)."
+        $KUBECTL_PATH delete node "$NODE" --force 2>/dev/null || true
+        log "Node $NODE removed."
+      done
+    else
+      log "No worker nodes found in cluster."
+    fi
+  else
+    warn "kubectl/admin.conf not found — skipping worker drain."
+  fi
+
+  # -----------------------------------------------
+  # STEP 2: Remove GPU Operator via Helm
+  # -----------------------------------------------
+  header "STEP 2: Removing NVIDIA GPU Operator"
+
+  if command -v helm &>/dev/null; then
+    # Delete GPU test pod if exists
     if kubectl get pod gpu-test -n default &>/dev/null 2>&1; then
       log "Deleting GPU test pod..."
       kubectl delete pod gpu-test -n default --force --grace-period=0 2>/dev/null || true
-      log "GPU test pod deleted."
-    else
-      log "No gpu-test pod found, skipping."
     fi
-
-    rm -f /root/gpu-test-pod.yaml && log "Removed gpu-test-pod.yaml" || true
+    rm -f /root/gpu-test-pod.yaml 2>/dev/null || true
 
     # Uninstall GPU Operator Helm release
     if helm status gpu-operator -n gpu-operator &>/dev/null 2>&1; then
       log "Uninstalling GPU Operator Helm release..."
       helm uninstall gpu-operator -n gpu-operator --wait --timeout=3m 2>/dev/null || true
-      log "GPU Operator Helm release removed."
     else
       log "GPU Operator Helm release not found, skipping."
     fi
 
-    # Delete the gpu-operator namespace
+    # Delete gpu-operator namespace
     if kubectl get namespace gpu-operator &>/dev/null 2>&1; then
       log "Deleting gpu-operator namespace..."
       kubectl delete namespace gpu-operator --force --grace-period=0 2>/dev/null || true
-      log "gpu-operator namespace deleted."
-    else
-      log "gpu-operator namespace not found, skipping."
     fi
 
     # Remove GPU Operator CRDs
     log "Removing GPU Operator CRDs..."
     kubectl get crd 2>/dev/null | grep -i 'nvidia\|nfd\|gpu' | awk '{print $1}' | \
       xargs kubectl delete crd --force --grace-period=0 2>/dev/null || true
-    log "GPU Operator CRDs removed."
 
     # Remove NVIDIA Helm repo
     if helm repo list 2>/dev/null | grep -q nvidia; then
       helm repo remove nvidia 2>/dev/null || true
-      log "NVIDIA Helm repo removed."
     fi
   else
     log "Helm not found — skipping Helm-based GPU Operator removal."
   fi
-else
-  log "Worker node: GPU Operator is managed by master. Skipping Helm removal."
-  log "(Run dispose master to remove the GPU Operator from the cluster.)"
-fi
 
-# -----------------------------------------------
-# STEP 5: Remove Helm (master only)
-# -----------------------------------------------
-header "STEP 5: Removing Helm"
+  # -----------------------------------------------
+  # STEP 3: Remove Helm
+  # -----------------------------------------------
+  header "STEP 3: Removing Helm"
 
-if [[ "$ROLE" == "master" ]]; then
-  if [[ -f /usr/local/bin/helm ]]; then
-    rm -f /usr/local/bin/helm
-    log "Helm binary removed."
-  else
-    log "Helm not found at /usr/local/bin/helm, skipping."
-  fi
-
+  rm -f /usr/local/bin/helm 2>/dev/null || true
   rm -rf /root/.cache/helm /root/.config/helm /root/.local/share/helm
 
   if [[ -n "$SUDO_USER" ]]; then
     USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
     rm -rf "$USER_HOME/.cache/helm" "$USER_HOME/.config/helm" "$USER_HOME/.local/share/helm"
   fi
-
   log "Helm fully removed."
-else
-  log "Worker node: Helm not installed on workers — skipping."
-fi
 
-# -----------------------------------------------
-# STEP 6: Remove NVIDIA Container Toolkit
-# -----------------------------------------------
-header "STEP 6: Removing NVIDIA Container Toolkit"
+  # -----------------------------------------------
+  # STEP 4: Reset kubeadm
+  # -----------------------------------------------
+  header "STEP 4: kubeadm Reset"
 
-apt remove -y --purge \
-  nvidia-container-toolkit \
-  nvidia-container-toolkit-base \
-  libnvidia-container-tools \
-  libnvidia-container1 \
-  2>/dev/null || true
-
-rm -f /etc/apt/sources.list.d/nvidia-container-toolkit.list
-rm -f /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
-
-apt autoremove -y --purge 2>/dev/null || true
-log "NVIDIA container toolkit removed."
-
-# -----------------------------------------------
-# STEP 7: Remove all Kubernetes packages
-# -----------------------------------------------
-header "STEP 7: Removing Kubernetes Packages"
-
-apt-mark unhold kubelet kubeadm kubectl 2>/dev/null || true
-
-apt remove -y --purge \
-  kubelet \
-  kubeadm \
-  kubectl \
-  kubernetes-cni \
-  containernetworking-plugins \
-  containerd \
-  runc \
-  2>/dev/null || true
-
-apt autoremove -y --purge 2>/dev/null || true
-apt clean
-
-log "Packages removed."
-
-# -----------------------------------------------
-# STEP 8: Remove all config and data directories
-# -----------------------------------------------
-header "STEP 8: Removing Directories & Files"
-
-DIRS=(
-  /etc/kubernetes
-  /var/lib/kubelet
-  /var/lib/etcd
-  /var/lib/containerd
-  /var/run/kubernetes
-  /etc/containerd
-  /opt/cni
-  /etc/cni
-  /var/lib/cni
-  /run/flannel
-  /etc/flannel
-  /var/log/pods
-  /var/log/containers
-  /root/.kube
-  /home/*/.kube
-)
-
-for DIR in "${DIRS[@]}"; do
-  if ls $DIR 2>/dev/null; then
-    rm -rf $DIR
-    log "Removed: $DIR"
+  if command -v kubeadm &>/dev/null; then
+    log "Running kubeadm reset..."
+    kubeadm reset -f || true
+  else
+    log "kubeadm not found, skipping."
   fi
-done
 
-# Remove join info file on master, join log on worker
-if [[ "$ROLE" == "master" ]]; then
-  rm -f /root/kubeadm-init.log
-  rm -f /root/kubeadm-worker-join-info.txt
-  rm -f /root/k8s-worker-join-info.txt
-  rm -f /root/gpu-operator-install.log
-  log "Removed master setup logs."
-else
-  rm -f /root/kubeadm-join.log
-  log "Removed worker join log."
-fi
+  # -----------------------------------------------
+  # STEP 5: Stop services
+  # -----------------------------------------------
+  header "STEP 5: Stopping Services"
 
-# -----------------------------------------------
-# STEP 9: Remove Kubernetes apt repo and keys
-# -----------------------------------------------
-header "STEP 9: Removing Kubernetes Apt Repo"
+  for SVC in kubelet containerd; do
+    systemctl stop $SVC 2>/dev/null    && log "Stopped $SVC."   || true
+    systemctl disable $SVC 2>/dev/null && log "Disabled $SVC."  || true
+  done
 
-rm -f /etc/apt/sources.list.d/kubernetes.list
-rm -f /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-apt update -y
+  # -----------------------------------------------
+  # STEP 6: Remove NVIDIA container toolkit
+  # -----------------------------------------------
+  header "STEP 6: Removing NVIDIA Container Toolkit"
 
-log "Kubernetes apt repo removed."
+  apt remove -y --purge \
+    nvidia-container-toolkit \
+    nvidia-container-toolkit-base \
+    libnvidia-container-tools \
+    libnvidia-container1 \
+    2>/dev/null || true
 
-# -----------------------------------------------
-# STEP 10: Remove sysctl and module config
-# -----------------------------------------------
-header "STEP 10: Removing sysctl & Module Config"
+  rm -f /etc/apt/sources.list.d/nvidia-container-toolkit.list
+  rm -f /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+  apt autoremove -y --purge 2>/dev/null || true
+  log "NVIDIA container toolkit removed."
 
-rm -f /etc/sysctl.d/k8s.conf
-rm -f /etc/modules-load.d/k8s.conf
-sysctl --system > /dev/null 2>&1
+  # -----------------------------------------------
+  # STEP 7: Remove Kubernetes packages
+  # -----------------------------------------------
+  header "STEP 7: Removing Kubernetes Packages"
 
-log "sysctl and module config removed."
+  apt-mark unhold kubelet kubeadm kubectl 2>/dev/null || true
 
-# -----------------------------------------------
-# STEP 11: Flush iptables rules
-# -----------------------------------------------
-header "STEP 11: Flushing iptables Rules"
+  apt remove -y --purge \
+    kubelet kubeadm kubectl \
+    kubernetes-cni containernetworking-plugins \
+    containerd runc \
+    2>/dev/null || true
 
-iptables -F
-iptables -X
-iptables -t nat -F
-iptables -t nat -X
-iptables -t mangle -F
-iptables -t mangle -X
-iptables -P INPUT ACCEPT
-iptables -P FORWARD ACCEPT
-iptables -P OUTPUT ACCEPT
+  apt autoremove -y --purge 2>/dev/null || true
+  apt clean
+  log "Packages removed."
 
-ip6tables -F
-ip6tables -X
-ip6tables -t nat -F    2>/dev/null || true
-ip6tables -t nat -X    2>/dev/null || true
-ip6tables -t mangle -F 2>/dev/null || true
-ip6tables -t mangle -X 2>/dev/null || true
-ip6tables -P INPUT ACCEPT
-ip6tables -P FORWARD ACCEPT
-ip6tables -P OUTPUT ACCEPT
+  # -----------------------------------------------
+  # STEP 8: Remove directories
+  # -----------------------------------------------
+  header "STEP 8: Removing Config & Data Directories"
 
-log "iptables flushed."
+  DIRS=(
+    /etc/kubernetes /var/lib/kubelet /var/lib/etcd
+    /var/lib/containerd /var/run/kubernetes /etc/containerd
+    /opt/cni /etc/cni /var/lib/cni
+    /run/flannel /etc/flannel
+    /var/log/pods /var/log/containers
+    /root/.kube "/home/*/.kube"
+    /root/kubeadm-init.log /root/gpu-operator-install.log
+    /root/worker-join.sh
+  )
 
-# -----------------------------------------------
-# STEP 12: Remove virtual network interfaces
-# -----------------------------------------------
-header "STEP 12: Removing Virtual Network Interfaces"
+  for DIR in "${DIRS[@]}"; do
+    if ls $DIR 2>/dev/null | head -1 &>/dev/null; then
+      rm -rf $DIR
+      log "Removed: $DIR"
+    fi
+  done
 
-for IFACE in flannel.1 cni0 docker0 tunl0; do
-  if ip link show $IFACE &>/dev/null; then
-    ip link set $IFACE down
-    ip link delete $IFACE
-    log "Removed interface: $IFACE"
+  # -----------------------------------------------
+  # STEP 9: Remove kube-dummy0 systemd service (master specific)
+  # -----------------------------------------------
+  header "STEP 9: Removing kube-dummy0 Interface & Service"
+
+  systemctl stop kube-dummy-iface.service 2>/dev/null || true
+  systemctl disable kube-dummy-iface.service 2>/dev/null || true
+  rm -f /etc/systemd/system/kube-dummy-iface.service
+  systemctl daemon-reload
+
+  if ip link show kube-dummy0 &>/dev/null 2>&1; then
+    ip link set kube-dummy0 down
+    ip link delete kube-dummy0
+    log "kube-dummy0 interface removed."
   fi
-done
 
-# -----------------------------------------------
-# STEP 13: Re-enable swap
-# -----------------------------------------------
-header "STEP 13: Re-enabling Swap"
+  log "kube-dummy service removed."
 
-systemctl unmask swap.target 2>/dev/null || true
-sed -i 's/^#\(.*swap.*\)/\1/' /etc/fstab
-swapon -a 2>/dev/null || true
-log "Swap re-enabled."
+  # -----------------------------------------------
+  # STEP 10: Remove apt repo and keys
+  # -----------------------------------------------
+  header "STEP 10: Removing Kubernetes Apt Repo"
 
-# -----------------------------------------------
-# STEP 14: Remove kubectl autocomplete from bashrc
-# -----------------------------------------------
-header "STEP 14: Cleaning .bashrc"
+  rm -f /etc/apt/sources.list.d/kubernetes.list
+  rm -f /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  apt update -y
+  log "Kubernetes apt repo removed."
 
-for RCFILE in /root/.bashrc /home/*/.bashrc; do
-  if [[ -f "$RCFILE" ]]; then
-    sed -i '/kubectl completion/d' "$RCFILE"
-    sed -i '/alias k=kubectl/d' "$RCFILE"
-    sed -i '/complete.*kubectl/d' "$RCFILE"
-    log "Cleaned: $RCFILE"
-  fi
-done
+  # -----------------------------------------------
+  # STEP 11: Sysctl and module config
+  # -----------------------------------------------
+  header "STEP 11: Removing sysctl & Module Config"
 
-# -----------------------------------------------
-# Done
-# -----------------------------------------------
-header "Cleanup Complete — $ROLE node"
+  rm -f /etc/sysctl.d/k8s.conf
+  rm -f /etc/modules-load.d/k8s.conf
+  sysctl --system > /dev/null 2>&1
+  log "sysctl and module config removed."
 
-echo -e "${GREEN}"
-echo "  Everything removed from this $ROLE node:"
-echo "    - kubeadm / kubelet / kubectl"
-echo "    - containerd / runc"
-echo "    - kubernetes-cni / containernetworking-plugins"
-echo "    - All config dirs (/etc/kubernetes, /var/lib/etcd, etc.)"
-echo "    - Kubernetes apt repo and GPG key"
-echo "    - iptables rules flushed"
-echo "    - Virtual network interfaces removed"
-echo "    - Swap re-enabled"
-echo "    - NVIDIA container toolkit + apt repo"
-if [[ "$ROLE" == "master" ]]; then
-echo "    - NVIDIA GPU Operator (Helm release + namespace + CRDs)"
-echo "    - Helm binary + cache"
-echo "    - GPU test pod"
-fi
-echo ""
+  # -----------------------------------------------
+  # STEP 12: Flush iptables
+  # -----------------------------------------------
+  header "STEP 12: Flushing iptables"
 
-if [[ "$ROLE" == "master" ]]; then
-  echo "  Master is fully clean. You can re-run: sudo bash install-kube-multi.sh master"
-else
-  echo "  Worker is fully clean."
-  echo "  Remember to also delete it from the master (if not done yet):"
-  echo "    kubectl delete node <this-hostname>"
+  iptables -F; iptables -X
+  iptables -t nat -F; iptables -t nat -X
+  iptables -t mangle -F; iptables -t mangle -X
+  iptables -P INPUT ACCEPT
+  iptables -P FORWARD ACCEPT
+  iptables -P OUTPUT ACCEPT
+
+  ip6tables -F; ip6tables -X
+  ip6tables -t nat -F 2>/dev/null; ip6tables -t nat -X 2>/dev/null
+  ip6tables -t mangle -F 2>/dev/null; ip6tables -t mangle -X 2>/dev/null
+  ip6tables -P INPUT ACCEPT
+  ip6tables -P FORWARD ACCEPT
+  ip6tables -P OUTPUT ACCEPT
+
+  log "iptables flushed."
+
+  # -----------------------------------------------
+  # STEP 13: Remove virtual network interfaces
+  # -----------------------------------------------
+  header "STEP 13: Removing Virtual Network Interfaces"
+
+  for IFACE in flannel.1 cni0 docker0 tunl0; do
+    if ip link show $IFACE &>/dev/null; then
+      ip link set $IFACE down
+      ip link delete $IFACE
+      log "Removed interface: $IFACE"
+    fi
+  done
+
+  # -----------------------------------------------
+  # STEP 14: Re-enable swap
+  # -----------------------------------------------
+  header "STEP 14: Re-enabling Swap"
+
+  systemctl unmask swap.target 2>/dev/null || true
+  sed -i 's/^#\(.*swap.*\)/\1/' /etc/fstab
+  swapon -a 2>/dev/null || true
+  log "Swap re-enabled."
+
+  # -----------------------------------------------
+  # STEP 15: Clean .bashrc
+  # -----------------------------------------------
+  header "STEP 15: Cleaning .bashrc"
+
+  for RCFILE in /root/.bashrc /home/*/.bashrc; do
+    if [[ -f "$RCFILE" ]]; then
+      sed -i '/kubectl completion/d' "$RCFILE"
+      sed -i '/alias k=kubectl/d' "$RCFILE"
+      sed -i '/complete.*kubectl/d' "$RCFILE"
+      log "Cleaned: $RCFILE"
+    fi
+  done
+
+  # -----------------------------------------------
+  # Done
+  # -----------------------------------------------
+  header "Full Cluster Cleanup Complete!"
+  echo -e "${GREEN}"
+  echo "  Everything has been removed:"
+  echo "    - All worker nodes drained and deleted"
+  echo "    - NVIDIA GPU Operator (Helm + namespace + CRDs)"
+  echo "    - NVIDIA container toolkit"
+  echo "    - Helm binary + cache"
+  echo "    - kubeadm / kubelet / kubectl / containerd / runc"
+  echo "    - All config dirs (/etc/kubernetes, /var/lib/etcd, etc.)"
+  echo "    - Kubernetes apt repo and GPG key"
+  echo "    - kube-dummy0 interface and systemd service"
+  echo "    - iptables rules, virtual interfaces"
+  echo "    - Swap re-enabled"
   echo ""
-  echo "  To re-join: sudo bash install-kube-multi.sh worker <MASTER_IP> <TOKEN> <HASH>"
-fi
+  echo "  Worker nodes still need to be individually reset:"
+  echo "    sudo bash dispose-kube.sh --role worker --master-ip <was-master-ip>"
+  echo -e "${NC}"
 
-echo -e "${NC}"
+fi
